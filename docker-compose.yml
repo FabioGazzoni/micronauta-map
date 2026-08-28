@@ -1,0 +1,12 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mapa-megaweb-backend
+    env_file:
+      - .env
+    ports:
+      - "0.0.0.0:5000:5000"
+    restart: unless-stopped
+
