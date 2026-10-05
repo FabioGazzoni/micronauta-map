@@ -21,10 +21,16 @@ MEGAWEB_PASSWORD = os.getenv("MEGAWEB_PASSWORD")
 
 TRAZAS_CACHE_TTL_SECONDS = 180
 
-# Cada cuánto se le piden coches a Megaweb, sin importar cuántos clientes
-# haya: dentro de este lapso todos reciben la misma respuesta cacheada.
-COCHES_CACHE_TTL_SECONDS = 30
-# Pasado el TTL se sigue devolviendo el dato anterior mientras se refresca
-# en segundo plano, pero nunca uno más viejo que esto (ej. tras horas sin uso
-# o con Megaweb caído): en ese caso se espera el pedido nuevo o se da error.
+# Cada cuánto el ticker le pide coches a Megaweb mientras haya pedidos del
+# front (1 pedido por ciclo sin importar cuántos clientes haya).
+COCHES_REFRESH_SECONDS = 30
+# Ticks seguidos sin ningún pedido del front tras los cuales el ticker se
+# detiene. Con 1, se detiene en el primer tick sin pedidos; subirlo evita el
+# arranque en frío tras pausas cortas, a costa de pedidos de más a Megaweb.
+COCHES_IDLE_TICKS = 1
+# Tope de espera de un pedido del front por el pedido a Megaweb en curso
+# (arranque en frío o Megaweb más lento que lo estimado). Debe quedar por
+# debajo del timeout de 30s de API Gateway/CloudFront.
+COCHES_MAX_WAIT_SECONDS = 20
+# Nunca se devuelven datos más viejos que esto (ej. Megaweb caído): error.
 COCHES_MAX_STALE_SECONDS = 120

@@ -3,7 +3,12 @@ import logging
 import threading
 import time
 
-from app.config import COCHES_CACHE_TTL_SECONDS, COCHES_MAX_STALE_SECONDS
+from app.config import (
+    COCHES_IDLE_TICKS,
+    COCHES_MAX_STALE_SECONDS,
+    COCHES_MAX_WAIT_SECONDS,
+    COCHES_REFRESH_SECONDS,
+)
 from app.models.trazas_cache import TrazasCache
 from app.repositories import megaweb_repository, session_repository
 from app.services import auth_service
@@ -12,19 +17,32 @@ logger = logging.getLogger(__name__)
 
 _trazas_cache = TrazasCache()
 
-# Caché compartida de coches. Se guarda la lista ya recortada y serializada
-# para no re-procesar nada por cada cliente. Se reemplaza la tupla entera
-# (asignación atómica), así que se puede leer sin tomar el lock.
-_coches_entry = None  # (coches_json: bytes, fetched_at: float) | None
-_coches_error = None  # (body, status) del último refresco fallido | None
-_coches_last_attempt = 0.0
-_coches_lock = threading.Lock()
+# --- Coches: caché compartida + ticker ---------------------------------------
+#
+# Un único hilo (el "ticker") le pide coches a Megaweb cada
+# COCHES_REFRESH_SECONDS mientras haya pedidos del front: cada pedido marca
+# _coches_requested y, si en un tick no hubo ninguno desde el anterior, el
+# ticker se detiene (tras COCHES_IDLE_TICKS ticks así). El primer pedido con
+# el ticker detenido lo arranca y espera el pedido a Megaweb (arranque en
+# frío). Los demás responden siempre desde la caché.
+#
+# Al front se le devuelve proximo_en = (próximo tick − ahora) + D_est + 0.5,
+# para que vuelva justo cuando el ticker ya dejó el dato nuevo en la caché.
+#
+# Todo el estado se lee/escribe bajo _coches_cond.
 
-# Con Megaweb fallando, no reintentar en segundo plano más seguido que esto.
-_COCHES_ERROR_RETRY_SECONDS = 10
-# Si se devolvió un dato vencido mientras se refresca en segundo plano, el
-# cliente vuelve a pedir en este tiempo para levantar el dato nuevo.
-_COCHES_REFRESHING_POLL_SECONDS = 3
+_coches_cond = threading.Condition()
+# Pide un tick inmediato (arranque en frío).
+_coches_wake = threading.Event()
+
+_coches_entry = None  # (json recortado y serializado: bytes, fetched_at) | None
+_coches_error = None  # (body, status) del último pedido fallido | None
+_coches_requested = False  # hubo pedidos del front desde el último tick
+_coches_next_tick = None  # timestamp del próximo tick | None = ticker detenido
+_coches_fetching = False
+_coches_generation = 0  # +1 al terminar cada pedido a Megaweb (ok o no)
+# Duración del último pedido exitoso a Megaweb (D_est).
+_coches_fetch_seconds = 3.0
 
 # Megaweb manda ~55 campos por coche (itinerarios ITV, indicadores de
 # puntualidad, etc.) de los que el mapa solo usa estos. Cuando un mismo dato
@@ -85,107 +103,152 @@ def _call_with_retry(fn):
 
 
 def _fetch_coches():
-    """Pide coches a Megaweb y actualiza la caché. Devuelve (body, status) si falla."""
-    global _coches_entry
-
+    """Pide coches a Megaweb, recorta y serializa. Devuelve (json, None) o (None, error)."""
     try:
         parsed = _call_with_retry(megaweb_repository.get_coches_raw)
     except session_repository.SessionUnusableError:
-        return _SESSION_ERROR_RESPONSE
+        return None, _SESSION_ERROR_RESPONSE
     except session_repository.MegawebUnavailableError as exc:
-        return {"ok": False, "error": str(exc)}, 502
+        return None, ({"ok": False, "error": str(exc)}, 502)
     except ValueError:
-        return {"ok": False, "error": "Megaweb no devolvió JSON válido."}, 502
+        return None, ({"ok": False, "error": "Megaweb no devolvió JSON válido."}, 502)
     except Exception:
-        logger.exception("Refresco de coches contra Megaweb falló.")
-        return {"ok": False, "error": "Error inesperado consultando Megaweb."}, 502
+        logger.exception("Pedido de coches contra Megaweb falló.")
+        return None, (
+            {"ok": False, "error": "Error inesperado consultando Megaweb."},
+            502,
+        )
 
     if not isinstance(parsed, dict) or not parsed.get("ok"):
-        return {
-            "ok": False,
-            "error": "Megaweb no devolvió una respuesta válida.",
-            "remote": parsed,
-        }, 502
+        return None, (
+            {
+                "ok": False,
+                "error": "Megaweb no devolvió una respuesta válida.",
+                "remote": parsed,
+            },
+            502,
+        )
 
     data = parsed.get("data") or {}
     coches = [_slim_coche(c) for c in (data.get("coches") or [])]
+    coches_json = json.dumps(coches, ensure_ascii=False, separators=(",", ":"))
+    return coches_json.encode(), None
 
-    _coches_entry = (
-        json.dumps(coches, ensure_ascii=False, separators=(",", ":")).encode(),
-        time.time(),
+
+def _ticker_loop():
+    global _coches_entry, _coches_error, _coches_requested, _coches_next_tick
+    global _coches_fetching, _coches_generation, _coches_fetch_seconds
+
+    idle_ticks = 0
+    while True:
+        with _coches_cond:
+            delay = _coches_next_tick - time.time()
+
+        woken = _coches_wake.wait(timeout=max(0, delay))
+        _coches_wake.clear()
+
+        with _coches_cond:
+            if woken:
+                # Arranque en frío: tick ya, y el ciclo se ancla a este momento.
+                _coches_next_tick = time.time() + COCHES_REFRESH_SECONDS
+            else:
+                if _coches_requested:
+                    idle_ticks = 0
+                else:
+                    idle_ticks += 1
+                    if idle_ticks >= COCHES_IDLE_TICKS:
+                        _coches_next_tick = None
+                        logger.info("Sin pedidos del front: ticker de coches detenido.")
+                        return
+                # Desde el tick anterior (no desde ahora) para que el ciclo no
+                # se corra con lo que tarda Megaweb.
+                _coches_next_tick += COCHES_REFRESH_SECONDS
+                _coches_requested = False
+            _coches_fetching = True
+
+        started = time.time()
+        coches_json, error = _fetch_coches()
+        elapsed = time.time() - started
+        logger.info(
+            "Pedido de coches a Megaweb: %s en %.1fs",
+            "ok" if error is None else "falló",
+            elapsed,
+        )
+
+        with _coches_cond:
+            if error is None:
+                _coches_entry = (coches_json, time.time())
+                _coches_fetch_seconds = elapsed
+            _coches_error = error
+            _coches_fetching = False
+            _coches_generation += 1
+            _coches_cond.notify_all()
+
+
+def _proximo_en():
+    if _coches_next_tick is None:
+        return COCHES_REFRESH_SECONDS
+    return max(
+        1.0,
+        (_coches_next_tick - time.time()) + _coches_fetch_seconds + 0.5,
     )
-    return None
 
 
-def _refresh_coches(blocking: bool):
-    """
-    Refresca la caché con un único pedido a Megaweb a la vez. Quien espera el
-    lock y encuentra que otro hilo ya intentó mientras tanto, usa ese
-    resultado (bueno o malo) en vez de repetir el pedido.
-    """
-    global _coches_error, _coches_last_attempt
-
-    waiting_since = time.time()
-    if not _coches_lock.acquire(blocking=blocking):
-        return
-    try:
-        if _coches_last_attempt >= waiting_since:
-            return
-        _coches_error = _fetch_coches()
-        _coches_last_attempt = time.time()
-    finally:
-        _coches_lock.release()
-
-
-def _coches_response(entry):
-    coches_json, fetched_at = entry
-    age = time.time() - fetched_at
-
-    if age < COCHES_CACHE_TTL_SECONDS:
-        proximo_en = COCHES_CACHE_TTL_SECONDS - age
-    elif _coches_error is not None:
-        proximo_en = COCHES_CACHE_TTL_SECONDS
-    else:
-        proximo_en = _COCHES_REFRESHING_POLL_SECONDS
-
-    head = json.dumps({
-        "ok": True,
-        "actualizado": fetched_at,
-        "proximo_en": round(proximo_en, 1),
-        # True = el último pedido a Megaweb falló y estos son los últimos
-        # datos buenos que se tienen.
-        "stale": _coches_error is not None,
-    })
-    # Se empalma la lista ya serializada en vez de volver a serializarla.
-    return head[:-1].encode() + b',"coches":' + coches_json + b"}", 200
+def _error_response(body, status):
+    return json.dumps({**body, "proximo_en": round(_proximo_en(), 1)}).encode(), status
 
 
 def get_coches():
     """Devuelve (body_json_bytes, status)."""
-    entry = _coches_entry
-    age = time.time() - entry[1] if entry else None
+    global _coches_requested, _coches_next_tick
 
-    if entry is None or age >= COCHES_MAX_STALE_SECONDS:
-        _refresh_coches(blocking=True)
+    with _coches_cond:
+        _coches_requested = True
+
+        ticker_running = _coches_next_tick is not None
+        if not ticker_running:
+            # Valor provisorio: el arranque en frío lo re-ancla.
+            _coches_next_tick = time.time() + COCHES_REFRESH_SECONDS
+            threading.Thread(target=_ticker_loop, daemon=True).start()
+
+        entry = _coches_entry
+        age = time.time() - entry[1] if entry else None
+        cold = not ticker_running and (
+            entry is None or age >= COCHES_REFRESH_SECONDS
+        )
+        if cold:
+            _coches_wake.set()
+
+        # En frío (propio o de otro pedido que todavía no arrancó), o si llegó
+        # mientras el ticker está pidiendo (Megaweb tardó más que D_est):
+        # esperar ese pedido, con tope por los 30s de timeout de API
+        # Gateway/CloudFront.
+        if cold or _coches_wake.is_set() or _coches_fetching:
+            generation = _coches_generation
+            _coches_cond.wait_for(
+                lambda: _coches_generation > generation,
+                timeout=COCHES_MAX_WAIT_SECONDS,
+            )
+
         entry = _coches_entry
         if entry is None or time.time() - entry[1] >= COCHES_MAX_STALE_SECONDS:
-            body, status = _coches_error or (
-                {"ok": False, "error": "No hay datos de coches disponibles."},
-                502,
-            )
-            return json.dumps(body).encode(), status
+            return _error_response(*(_coches_error or (
+                {"ok": False, "error": "Megaweb está tardando en responder."},
+                504,
+            )))
 
-    elif age >= COCHES_CACHE_TTL_SECONDS:
-        retry_after = _COCHES_ERROR_RETRY_SECONDS if _coches_error else 0
-        if (
-            not _coches_lock.locked()
-            and time.time() - _coches_last_attempt >= retry_after
-        ):
-            threading.Thread(
-                target=_refresh_coches, args=(False,), daemon=True
-            ).start()
+        coches_json, fetched_at = entry
+        head = json.dumps({
+            "ok": True,
+            "actualizado": fetched_at,
+            "proximo_en": round(_proximo_en(), 1),
+            # True = el último pedido a Megaweb falló y estos son los últimos
+            # datos buenos que se tienen.
+            "stale": _coches_error is not None,
+        })
 
-    return _coches_response(entry)
+    # Se empalma la lista ya serializada en vez de volver a serializarla.
+    return head[:-1].encode() + b',"coches":' + coches_json + b"}", 200
 
 
 def get_trazas():
