@@ -8,5 +8,8 @@ services:
       - .env
     ports:
       - "0.0.0.0:5000:5000"
+    volumes:
+      # Última lista buena de empresas habilitadas (sobrevive reinicios).
+      - ./data:/app/data
     restart: unless-stopped
 
