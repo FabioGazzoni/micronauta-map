@@ -11,7 +11,7 @@ from app.config import (
 )
 from app.models.trazas_cache import TrazasCache
 from app.repositories import megaweb_repository, session_repository
-from app.services import auth_service, empresas_service
+from app.services import auth_service
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +130,7 @@ def _fetch_coches():
         )
 
     data = parsed.get("data") or {}
-    coches = empresas_service.filtrar_coches(
-        [_slim_coche(c) for c in (data.get("coches") or [])]
-    )
+    coches = [_slim_coche(c) for c in (data.get("coches") or [])]
     coches_json = json.dumps(coches, ensure_ascii=False, separators=(",", ":"))
     return coches_json.encode(), None
 

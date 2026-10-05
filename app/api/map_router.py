@@ -1,6 +1,6 @@
 from flask import Blueprint, Response, current_app, jsonify
 
-from app.services import megaweb_service
+from app.services import empresas_service, megaweb_service
 
 bp = Blueprint("map", __name__)
 
@@ -25,4 +25,10 @@ def trazas():
 @bp.route("/api/clientes")
 def clientes():
     body, status = megaweb_service.get_clientes()
+    return jsonify(body), status
+
+
+@bp.route("/api/empresas")
+def empresas():
+    body, status = empresas_service.get_empresas()
     return jsonify(body), status

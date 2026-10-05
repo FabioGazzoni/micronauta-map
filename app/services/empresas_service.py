@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import threading
 import time
 import unicodedata
 
@@ -16,18 +17,18 @@ from app.repositories import empresas_repository
 
 logger = logging.getLogger(__name__)
 
-# Solo lo usa el hilo ticker de coches (megaweb_service), así que no hace
-# falta lock.
+# Lo leen los pedidos a /api/empresas (varios hilos de Flask a la vez).
+_lock = threading.Lock()
 _index = None  # (por_nombre: {nombre normalizado: cuit}, etiquetas: {cuit: nombre visible})
 _loaded_at = 0.0
 _next_attempt = 0.0
 _cache_file_checked = False
-_last_report = None
 
 
 def normalize_name(name) -> str:
     """
-    Misma regla para Megaweb y para la tabla: sin acentos, minúsculas, sin
+    Misma regla para Megaweb y para la tabla (y la misma que
+    normalizeEmpresaName en static/app.js): sin acentos, minúsculas, sin
     puntos ni comillas ("S.A.T." -> "sat") y cualquier otro signo como
     espacio, colapsando espacios. "S.A.T. - HIGUERAS" -> "sat higueras".
     """
@@ -107,7 +108,7 @@ def _save_cache_file(businesses, loaded_at):
 
 
 def _get_index():
-    """Lista vigente; la relee cada hora y, si falla, sigue con la última buena."""
+    """Lista vigente; la relee una vez por día y, si falla, sigue con la última buena."""
     global _index, _loaded_at, _next_attempt, _cache_file_checked
 
     if not _cache_file_checked:
@@ -137,60 +138,33 @@ def _get_index():
     return _index
 
 
-def _report(sin_match, habilitadas_sin_coches):
-    """Loguea solo cuando cambia, para no repetirlo en cada tick de 30s."""
-    global _last_report
-
-    report = (frozenset(sin_match), frozenset(habilitadas_sin_coches))
-    if report == _last_report:
-        return
-    _last_report = report
-
-    logger.info(
-        "Empresas de Megaweb no habilitadas o sin coincidencia (%d): %s",
-        len(sin_match), sorted(sin_match),
-    )
-    if habilitadas_sin_coches:
-        logger.warning(
-            "Empresas habilitadas sin coches en Megaweb (sin unidades activas o "
-            "nombre que no coincide; ver EMPRESAS_ALIASES): %s",
-            sorted(habilitadas_sin_coches),
-        )
-
-
-def filtrar_coches(coches):
+def get_empresas():
     """
-    Deja solo los coches de empresas habilitadas y les agrega empresa_cuit y
-    empresa_grupo (nombre visible). Con el filtro desactivado se agrupa por
-    empresa_nombre, como antes.
+    Devuelve (body, status) para /api/empresas: solo las habilitadas, cada una
+    con sus nombres ya normalizados (incluidos los alias de config) para que
+    el front cruce los coches por empresa_nombre. Con el filtro desactivado,
+    empresas = None y el front agrupa por empresa_nombre.
     """
     if not EMPRESAS_FILTER_ENABLED:
-        for c in coches:
-            c["empresa_cuit"] = None
-            c["empresa_grupo"] = c.get("empresa_nombre")
-        return coches
+        return {"ok": True, "empresas": None}, 200
 
-    index = _get_index()
+    with _lock:
+        index = _get_index()
+        loaded_at = _loaded_at
+
     if index is None:
-        logger.error("Sin lista de empresas habilitadas: no se muestra ningún coche.")
-        return []
+        return {"ok": False, "error": "No hay lista de empresas habilitadas disponible."}, 503
 
     por_nombre, etiquetas = index
-    aliases = {normalize_name(k): str(v) for k, v in EMPRESAS_ALIASES.items()}
+    nombres = {cuit: set() for cuit in etiquetas}
+    for nombre, cuit in por_nombre.items():
+        nombres[cuit].add(nombre)
+    for alias, cuit in EMPRESAS_ALIASES.items():
+        if str(cuit) in nombres:
+            nombres[str(cuit)].add(normalize_name(alias))
 
-    filtrados = []
-    sin_match = set()
-    for c in coches:
-        nombre = normalize_name(c.get("empresa_nombre"))
-        cuit = por_nombre.get(nombre) or aliases.get(nombre)
-        if cuit not in etiquetas:
-            sin_match.add(c.get("empresa_nombre") or "")
-            continue
-        c["empresa_cuit"] = cuit
-        c["empresa_grupo"] = etiquetas[cuit]
-        filtrados.append(c)
-
-    con_coches = {c["empresa_cuit"] for c in filtrados}
-    _report(sin_match, {etiquetas[cuit] for cuit in etiquetas if cuit not in con_coches})
-
-    return filtrados
+    empresas = [
+        {"cuit": cuit, "nombre": etiquetas[cuit], "nombres": sorted(nombres[cuit])}
+        for cuit in sorted(etiquetas, key=lambda c: normalize_name(etiquetas[c]))
+    ]
+    return {"ok": True, "actualizado": loaded_at, "empresas": empresas}, 200

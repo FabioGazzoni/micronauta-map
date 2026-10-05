@@ -36,17 +36,18 @@ COCHES_MAX_WAIT_SECONDS = 20
 COCHES_MAX_STALE_SECONDS = 120
 
 # --- Empresas habilitadas ------------------------------------------------------
-# Solo se muestran los coches de empresas habilitadas para descargar
-# (is_downloaded=true) en la tabla micronauta_businesses de la otra cuenta
-# AWS. Desactivado por defecto: en local (Docker en la PC) la tabla rechaza la
+# /api/empresas sirve las empresas habilitadas para descargar
+# (is_downloaded=true) de la tabla micronauta_businesses de la otra cuenta
+# AWS; el front agrupa los coches por esas empresas y el resto va a "Otras".
+# Desactivado por defecto: en local (Docker en la PC) la tabla rechaza la
 # lectura porque su política solo admite la IP de la EC2.
 EMPRESAS_FILTER_ENABLED = os.getenv("EMPRESAS_FILTER_ENABLED", "false").lower() == "true"
 EMPRESAS_TABLE_ARN = os.getenv(
     "EMPRESAS_TABLE_ARN",
     "arn:aws:dynamodb:us-east-2:417755752792:table/micronauta_businesses",
 )
-# Se agregan empresas muy de vez en cuando: alcanza con releer cada hora.
-EMPRESAS_REFRESH_SECONDS = 3600
+# Se agregan empresas muy de vez en cuando: alcanza con releer una vez por día.
+EMPRESAS_REFRESH_SECONDS = 24 * 3600
 # Si la lectura falla, no reintentar más seguido que esto.
 EMPRESAS_RETRY_SECONDS = 300
 # Última lista buena en disco, para sobrevivir reinicios del contenedor
