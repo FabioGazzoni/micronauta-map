@@ -1,4 +1,4 @@
-from flask import Blueprint, current_app, jsonify
+from flask import Blueprint, Response, current_app, jsonify
 
 from app.services import megaweb_service
 
@@ -13,7 +13,7 @@ def index():
 @bp.route("/api/coches")
 def coches():
     body, status = megaweb_service.get_coches()
-    return jsonify(body), status
+    return Response(body, status=status, mimetype="application/json")
 
 
 @bp.route("/api/trazas")

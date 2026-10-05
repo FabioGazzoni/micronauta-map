@@ -20,3 +20,11 @@ MEGAWEB_USERNAME = os.getenv("MEGAWEB_USERNAME")
 MEGAWEB_PASSWORD = os.getenv("MEGAWEB_PASSWORD")
 
 TRAZAS_CACHE_TTL_SECONDS = 180
+
+# Cada cuánto se le piden coches a Megaweb, sin importar cuántos clientes
+# haya: dentro de este lapso todos reciben la misma respuesta cacheada.
+COCHES_CACHE_TTL_SECONDS = 30
+# Pasado el TTL se sigue devolviendo el dato anterior mientras se refresca
+# en segundo plano, pero nunca uno más viejo que esto (ej. tras horas sin uso
+# o con Megaweb caído): en ese caso se espera el pedido nuevo o se da error.
+COCHES_MAX_STALE_SECONDS = 120
